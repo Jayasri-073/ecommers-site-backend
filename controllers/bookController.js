@@ -1,26 +1,20 @@
 const path = require("path");
-const fs = require("fs");
 const multer = require("multer");
+const cloudinary = require("cloudinary").v2;
 const Book = require("../models/book");
 
-// Setup Multer Storage for image uploads
-const uploadDir = path.join(__dirname, "..", "uploads");
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
-}
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-    cb(null, uniqueSuffix + path.extname(file.originalname));
-  }
+// Configure Cloudinary if credentials are in process.env
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
+// Setup Multer Storage with Memory Storage for Vercel serverless compatibility
+const storage = multer.memoryStorage();
+
 const fileFilter = (req, file, cb) => {
-  if (file.mimetype.startsWith("image/")) {
+  if (file && file.mimetype && file.mimetype.startsWith("image/")) {
     cb(null, true);
   } else {
     cb(new Error("Only images are allowed!"), false);
@@ -33,16 +27,42 @@ exports.upload = multer({
   limits: { fileSize: 5 * 1024 * 1024 }
 });
 
-// Helper to determine relative cover image path
-const getUploadedCoverPath = (file) => {
-  return file ? `/uploads/${file.filename}` : null;
+// Helper to upload image buffer to Cloudinary
+const uploadToCloudinary = (fileBuffer) => {
+  return new Promise((resolve, reject) => {
+    if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
+      return reject(new Error("Cloudinary credentials are not configured in environment variables."));
+    }
+
+    const uploadStream = cloudinary.uploader.upload_stream(
+      { folder: "bookverse_books" },
+      (error, result) => {
+        if (error) return reject(error);
+        resolve(result.secure_url);
+      }
+    );
+
+    uploadStream.end(fileBuffer);
+  });
+};
+
+const processImageUpload = async (req) => {
+  if (req.file) {
+    if (process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET) {
+      return await uploadToCloudinary(req.file.buffer);
+    } else {
+      console.warn("Cloudinary not configured. Cannot process uploaded file in serverless mode. Falling back to body coverImage.");
+      return null;
+    }
+  }
+  return null;
 };
 
 const serializeBook = (book) => {
   const serialized = book.toObject ? book.toObject() : book;
   return {
     ...serialized,
-    image: serialized.image || serialized.coverImage || ""
+    image: serialized.coverImage || serialized.image || ""
   };
 };
 
@@ -125,9 +145,8 @@ exports.createBook = async (req, res) => {
       return res.status(400).json({ message: "Title, author, price, and stock are required" });
     }
 
-    // Determine coverImage: uploaded file relative path takes precedence over body
-    const uploadedPath = getUploadedCoverPath(req.file);
-    const finalCoverImage = uploadedPath || coverImage || req.body.image || "";
+    const uploadedCloudinaryUrl = await processImageUpload(req);
+    const finalCoverImage = uploadedCloudinaryUrl || coverImage || req.body.image || "";
 
     const book = await Book.create({
       title,
@@ -160,10 +179,9 @@ exports.updateBook = async (req, res) => {
       return res.status(404).json({ message: "Book not found" });
     }
 
-    // Update cover image if a file is uploaded
-    const uploadedPath = getUploadedCoverPath(req.file);
-    if (uploadedPath) {
-      book.coverImage = uploadedPath;
+    const uploadedCloudinaryUrl = await processImageUpload(req);
+    if (uploadedCloudinaryUrl) {
+      book.coverImage = uploadedCloudinaryUrl;
     } else if (coverImage !== undefined || req.body.image !== undefined) {
       book.coverImage = coverImage !== undefined ? coverImage : req.body.image;
     }
@@ -218,7 +236,6 @@ exports.addReview = async (req, res) => {
       return res.status(404).json({ message: "Book not found" });
     }
 
-    // Check if user already reviewed this book
     const alreadyReviewedIndex = book.reviews.findIndex(
       (r) => r.user.toString() === req.user._id.toString()
     );
@@ -236,13 +253,11 @@ exports.addReview = async (req, res) => {
       });
     }
 
-    // Re-calculate rating
     const totalRating = book.reviews.reduce((sum, item) => sum + item.rating, 0);
     book.rating = parseFloat((totalRating / book.reviews.length).toFixed(1));
 
     await book.save();
     
-    // Fetch book populated with user details for response
     const updatedBook = await Book.findById(req.params.id).populate("reviews.user", "username");
 
     res.status(201).json({ message: "Review saved successfully", book: updatedBook });

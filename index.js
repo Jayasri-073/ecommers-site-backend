@@ -2,50 +2,91 @@ require("dotenv").config();
 
 const express = require("express");
 const mongoose = require("mongoose");
+const cors = require("cors");
 const path = require("path");
+const multer = require("multer");
+
 const authRoutes = require("./routes/authRoutes");
 const bookRoutes = require("./routes/bookRoutes");
 const cartRoutes = require("./routes/cartRoutes");
 const orderRoutes = require("./routes/orderRoutes");
+const adminRoutes = require("./routes/adminRoutes");
+
 const Book = require("./models/book");
 const User = require("./models/user");
 const seedData = require("./seedData.json");
+
 const app = express();
-const multer = require("multer"); 
-const port = process.env.PORT || 5000;
-const mongoUri = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/bookverse";
-// Enable CORS
-app.use((req, res, next) => {
-  const allowedOrigins = new Set([
-    process.env.CLIENT_URL || "http://localhost:5173",
-    "http://localhost:5173",
-    "http://localhost:3000"
-  ]);
-  const origin = req.headers.origin;
-  if (origin && allowedOrigins.has(origin)) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-  }
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  res.setHeader("Access-Control-Allow-Credentials", "true");
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(200);
-  }
-  next();
-});
+
+// CORS Configuration
+const allowedOrigins = [
+  process.env.CLIENT_URL,
+  "http://localhost:5173",
+  "http://localhost:3000"
+].filter(Boolean);
+
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      if (!origin || allowedOrigins.includes(origin) || process.env.NODE_ENV !== "production") {
+        return callback(null, true);
+      }
+      return callback(new Error("CORS policy violation: Origin not allowed"), false);
+    },
+    credentials: true
+  })
+);
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-// Serve uploaded images statically
+
+// Serve uploaded images statically (legacy fallback for local files)
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
-// Connect to Database and Seed Books and Users if empty
-mongoose.connect(mongoUri, { serverSelectionTimeoutMS: 5000 })
-  .then(async () => {
-    console.log(`Connected to MongoDB at ${mongoUri}`);
+
+// Global Mongoose Connection Caching for Serverless Execution
+let cached = global.mongooseCache;
+if (!cached) {
+  cached = global.mongooseCache = { conn: null, promise: null };
+}
+
+let isSeeded = false;
+
+async function connectToDatabase() {
+  if (cached.conn && mongoose.connection.readyState === 1) {
+    return cached.conn;
+  }
+
+  if (!cached.promise) {
+    const mongoUri = process.env.MONGO_URI;
+    if (!mongoUri) {
+      throw new Error("MONGO_URI environment variable is missing.");
+    }
+
+    cached.promise = mongoose.connect(mongoUri, {
+      serverSelectionTimeoutMS: 5000
+    }).then((mongooseInstance) => {
+      console.log("Connected to MongoDB successfully");
+      return mongooseInstance;
+    }).catch((err) => {
+      cached.promise = null;
+      throw err;
+    });
+  }
+
+  try {
+    cached.conn = await cached.promise;
+  } catch (err) {
+    cached.promise = null;
+    throw err;
+  }
+
+  if (!isSeeded) {
     await seedDatabase();
-  })
-  .catch((err) => {
-    console.error("Error connecting to MongoDB:", err);
-  });
+    isSeeded = true;
+  }
+
+  return cached.conn;
+}
 
 // Seed function
 async function seedDatabase() {
@@ -70,7 +111,6 @@ async function seedDatabase() {
     const userCount = await User.countDocuments();
     if (userCount === 0) {
       console.log("Seeding users to MongoDB...");
-      // Save users (their passwords will be hashed by the mongoose pre-save hook)
       for (const u of seedData.users) {
         await User.create(u);
       }
@@ -81,8 +121,29 @@ async function seedDatabase() {
   }
 }
 
+// Ensure Database connection for every incoming request
+app.use(async (req, res, next) => {
+  try {
+    await connectToDatabase();
+    next();
+  } catch (err) {
+    console.error("Database connection error:", err.message);
+    res.status(500).json({ message: "Database connection failed", error: err.message });
+  }
+});
+
+// Root endpoint
 app.get("/", (req, res) => {
-  res.send("Welcome to the E-commerce site backend!");
+  res.json({
+    message: "Welcome to the BookVerse E-commerce API",
+    status: "online",
+    environment: process.env.NODE_ENV || "development"
+  });
+});
+
+// Health check endpoint
+app.get("/api/health", (req, res) => {
+  res.json({ status: "healthy", timestamp: new Date().toISOString() });
 });
 
 // Setup Routes
@@ -90,7 +151,9 @@ app.use("/api/auth", authRoutes);
 app.use("/api/books", bookRoutes);
 app.use("/api/cart", cartRoutes);
 app.use("/api/orders", orderRoutes);
+app.use("/api/admin", adminRoutes);
 
+// Error Handling Middleware
 app.use((error, req, res, next) => {
   if (error instanceof multer.MulterError) {
     const message = error.code === "LIMIT_FILE_SIZE"
@@ -103,12 +166,22 @@ app.use((error, req, res, next) => {
     return res.status(400).json({ message: error.message });
   }
 
-  next(error);
+  console.error("Global Error Handler:", error);
+  res.status(error.status || 500).json({
+    message: process.env.NODE_ENV === "production" ? "Internal Server Error" : error.message
+  });
 });
 
-app.listen(port, () => {
-  console.log(`Server is running on http://localhost:${port}`);
-});
+// Start persistent server only when running locally (not on Vercel serverless)
+if (require.main === module || process.env.NODE_ENV !== "production") {
+  const port = process.env.PORT || 5000;
+  app.listen(port, () => {
+    console.log(`Server is running on http://localhost:${port}`);
+  });
+}
+
+// Export Express app for Vercel Serverless Functions
+module.exports = app;
 
 
 
